@@ -36,6 +36,7 @@ pkey=/etc/coturn/key.pem
 no-multicast-peers
 simple-log
 log-file=stdout
+pidfile=/tmp/turnserver.pid
 EOF
 sudo chown 65534:65534 "$TURN_CONFIG"
 sudo chmod 600 "$TURN_CONFIG"
