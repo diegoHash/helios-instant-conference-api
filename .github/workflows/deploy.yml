@@ -1,0 +1,70 @@
+name: Test and deploy signaling API
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: helios-conferences-production
+  cancel-in-progress: true
+
+jobs:
+  test-and-deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Test and build
+        run: npm test
+
+      - name: Create deployment artifact
+        run: tar -czf helios-conferences-release.tgz dist package.json package-lock.json
+
+      - name: Configure SSH
+        env:
+          EC2_KEY_PEM: ${{ secrets.EC2_KEY_PEM }}
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s' "$EC2_KEY_PEM" > ~/.ssh/helios.pem
+          chmod 600 ~/.ssh/helios.pem
+          ssh-keyscan -H "$EC2_HOST" >> ~/.ssh/known_hosts
+
+      - name: Upload release
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+        run: scp -i ~/.ssh/helios.pem helios-conferences-release.tgz "$EC2_USER@$EC2_HOST:/home/$EC2_USER/helios-conferences-release.tgz"
+
+      - name: Activate release
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+        run: |
+          ssh -i ~/.ssh/helios.pem "$EC2_USER@$EC2_HOST" '
+            set -euo pipefail
+            app_dir=/home/'"$EC2_USER"'/helios-instant-conferences-backend
+            mkdir -p "$app_dir"
+            tar -xzf /home/'"$EC2_USER"'/helios-conferences-release.tgz -C "$app_dir"
+            cd "$app_dir"
+            npm ci --omit=dev
+            rm -f /home/'"$EC2_USER"'/helios-conferences-release.tgz
+            sudo systemctl restart helios-conferences.service
+            sudo systemctl is-active --quiet helios-conferences.service
+            curl --fail --silent --show-error http://127.0.0.1:8787/health
+          '

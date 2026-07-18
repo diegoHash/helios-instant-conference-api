@@ -1,0 +1,21 @@
+[Unit]
+Description=Helios Instant Conferences signaling service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ec2-user
+Group=ec2-user
+WorkingDirectory=/home/ec2-user/helios-instant-conferences-backend
+EnvironmentFile=/etc/helios-conferences.env
+ExecStart=/usr/bin/node /home/ec2-user/helios-instant-conferences-backend/dist/server.js
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+
+[Install]
+WantedBy=multi-user.target

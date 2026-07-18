@@ -1,0 +1,17 @@
+[Unit]
+Description=Helios coturn relay
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=5
+ExecStartPre=-/usr/bin/docker rm -f helios-coturn
+ExecStart=/usr/bin/docker run --name helios-coturn --network host --read-only --tmpfs /tmp --tmpfs /var/lib/coturn -v /etc/coturn:/etc/coturn:ro coturn/coturn@sha256:0c0e8fc0c263b85a134e9e4242b5e46e1f4c077c5029633511191c05b5c2c814 -c /etc/coturn/turnserver.conf
+ExecStop=/usr/bin/docker stop -t 10 helios-coturn
+ExecStopPost=-/usr/bin/docker rm -f helios-coturn
+
+[Install]
+WantedBy=multi-user.target

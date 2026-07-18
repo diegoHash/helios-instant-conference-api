@@ -1,0 +1,24 @@
+# Replace the public/private addresses and secret before deployment.
+listening-port=3478
+tls-listening-port=5349
+listening-ip=0.0.0.0
+external-ip=EC2_PUBLIC_IPV4/EC2_PRIVATE_IPV4
+realm=turn.caribbean-one.site
+server-name=turn.caribbean-one.site
+
+fingerprint
+use-auth-secret
+static-auth-secret=REPLACE_WITH_THE_SAME_TURN_SHARED_SECRET
+stale-nonce=600
+
+min-port=49160
+max-port=49200
+
+no-multicast-peers
+no-loopback-peers
+no-cli
+no-tcp-relay
+
+# Enable these after installing the TLS certificate for the TURN hostname.
+# cert=/etc/letsencrypt/live/turn.caribbean-one.site/fullchain.pem
+# pkey=/etc/letsencrypt/live/turn.caribbean-one.site/privkey.pem
