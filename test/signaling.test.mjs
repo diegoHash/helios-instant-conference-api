@@ -107,6 +107,14 @@ test('LiveKit token endpoint stays unavailable until the SFU is configured', asy
   });
   assert.equal(response.status, 503);
   assert.equal((await response.json()).error, 'SFU_NOT_CONFIGURED');
+
+  const lookup = await fetch(`${baseUrl}/api/livekit/resolve-room`, {
+    method: 'POST',
+    headers: { Origin: origin, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ code: 'abc12' }),
+  });
+  assert.equal(lookup.status, 503);
+  assert.equal((await lookup.json()).error, 'SFU_NOT_CONFIGURED');
 });
 
 test('a room accepts two participants, relays signals, and rejects a third', async t => {

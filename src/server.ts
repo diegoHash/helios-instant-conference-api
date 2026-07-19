@@ -64,6 +64,7 @@ const rooms = new Map<string, Map<string, Participant>>();
 const sockets = new Map<WebSocket, Participant>();
 const whiteboardRooms = new Map<string, WhiteboardRoom>();
 const whiteboardClients = new Map<WebSocket, WhiteboardClient>();
+const roomCodeLookups = new Map<string, { startedAt: number; count: number }>();
 
 function readPositiveInteger(name: string, fallback: number) {
   const value = Number(process.env[name]);
@@ -161,6 +162,32 @@ async function issueLivekitToken(request: IncomingMessage, response: ServerRespo
   } catch (error) {
     console.error('[helios-conferences] LiveKit token error', error);
     return json(response, 500, { error: 'TOKEN_ISSUE_FAILED' }, origin);
+  }
+}
+
+async function resolveLivekitRoom(request: IncomingMessage, response: ServerResponse, origin?: string) {
+  if (!livekitRooms) return json(response, 503, { error: 'SFU_NOT_CONFIGURED' }, origin);
+  try {
+    const address = String(request.headers['x-real-ip'] || request.socket.remoteAddress || 'unknown');
+    const now = Date.now();
+    const attempts = roomCodeLookups.get(address);
+    const windowState = !attempts || now - attempts.startedAt >= 60_000 ? { startedAt: now, count: 0 } : attempts;
+    windowState.count += 1;
+    roomCodeLookups.set(address, windowState);
+    if (windowState.count > 30) return json(response, 429, { error: 'TOO_MANY_LOOKUPS' }, origin);
+
+    const body = await readJsonBody(request);
+    const code = typeof body.code === 'string' ? body.code.trim().toLowerCase() : '';
+    if (!/^[a-z0-9_-]{5}$/.test(code)) return json(response, 400, { error: 'INVALID_ROOM_CODE' }, origin);
+    const matches = (await livekitRooms.listRooms()).filter(room => room.name.toLowerCase().endsWith(code));
+    if (matches.length === 0) return json(response, 404, { error: 'ROOM_NOT_FOUND' }, origin);
+    if (matches.length > 1) return json(response, 409, { error: 'ROOM_CODE_AMBIGUOUS' }, origin);
+    const [match] = matches;
+    if (!match) return json(response, 404, { error: 'ROOM_NOT_FOUND' }, origin);
+    return json(response, 200, { roomId: match.name }, origin);
+  } catch (error) {
+    console.error('[helios-conferences] Room code resolution error', error);
+    return json(response, 500, { error: 'ROOM_LOOKUP_FAILED' }, origin);
   }
 }
 
@@ -318,6 +345,9 @@ const server = createServer(async (request: IncomingMessage, response: ServerRes
   }
   if (request.method === 'POST' && url.pathname === '/api/livekit/token') {
     return issueLivekitToken(request, response, origin);
+  }
+  if (request.method === 'POST' && url.pathname === '/api/livekit/resolve-room') {
+    return resolveLivekitRoom(request, response, origin);
   }
   return json(response, 404, { error: 'NOT_FOUND' }, origin);
 });
