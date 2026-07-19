@@ -30,6 +30,16 @@ function openSocket() {
   });
 }
 
+function openWhiteboardSocket(roomId, displayName, expectedTypes = []) {
+  return new Promise((resolve, reject) => {
+    const params = new URLSearchParams({ roomId, displayName });
+    const socket = new WebSocket(`ws://127.0.0.1:${port}/whiteboard?${params}`, { origin });
+    const messages = expectedTypes.map(type => nextMessage(socket, type));
+    socket.once('open', () => resolve({ socket, messages }));
+    socket.once('error', reject);
+  });
+}
+
 function nextMessage(socket, expectedType) {
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => reject(new Error(`Timed out waiting for ${expectedType}`)), 2_000);
@@ -118,4 +128,33 @@ test('a room accepts two participants, relays signals, and rejects a third', asy
   third.send(JSON.stringify({ type: 'join', roomId: 'test-room', displayName: 'Tercero' }));
   const rejected = await thirdJoinResponse;
   assert.equal(rejected.code, 'ROOM_FULL');
+});
+
+test('whiteboard state is shared with late participants and removed when the room empties', async t => {
+  const { socket: first, messages: [firstMode] } = await openWhiteboardSocket('board-room', 'Primero', ['whiteboard-mode']);
+  t.after(() => first.close());
+  assert.equal((await firstMode).open, false);
+
+  first.send(JSON.stringify({ type: 'whiteboard-mode', open: true }));
+  first.send(JSON.stringify({ type: 'upsert', element: { id: 'stroke-1', kind: 'path', points: [[1, 2], [3, 4]] } }));
+
+  const { socket: second, messages: [secondMode, secondUpsert] } = await openWhiteboardSocket(
+    'board-room', 'Segundo', ['whiteboard-mode', 'upsert'],
+  );
+  t.after(() => second.close());
+  assert.equal((await secondMode).open, true);
+  const upsert = await secondUpsert;
+  assert.equal(upsert.element.id, 'stroke-1');
+
+  first.close();
+  second.close();
+  await Promise.all([
+    new Promise(resolve => first.once('close', resolve)),
+    new Promise(resolve => second.once('close', resolve)),
+  ]);
+  await delay(50);
+
+  const { socket: third, messages: [thirdMode] } = await openWhiteboardSocket('board-room', 'Tercero', ['whiteboard-mode']);
+  t.after(() => third.close());
+  assert.equal((await thirdMode).open, false);
 });

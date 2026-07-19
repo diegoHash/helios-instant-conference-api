@@ -16,6 +16,21 @@ type Participant = {
   messagesInWindow: number;
 };
 
+type WhiteboardClient = {
+  id: string;
+  roomId: string;
+  displayName: string;
+  socket: WebSocket;
+  rateWindowStartedAt: number;
+  messagesInWindow: number;
+};
+
+type WhiteboardRoom = {
+  open: boolean;
+  elements: Map<string, JsonRecord>;
+  clients: Map<string, WhiteboardClient>;
+};
+
 const config = {
   nodeEnv: process.env.NODE_ENV ?? 'development',
   host: process.env.HOST ?? '0.0.0.0',
@@ -46,6 +61,8 @@ const livekitRooms = livekitConfigured
 
 const rooms = new Map<string, Map<string, Participant>>();
 const sockets = new Map<WebSocket, Participant>();
+const whiteboardRooms = new Map<string, WhiteboardRoom>();
+const whiteboardClients = new Map<WebSocket, WhiteboardClient>();
 
 function readPositiveInteger(name: string, fallback: number) {
   const value = Number(process.env[name]);
@@ -187,7 +204,7 @@ function parseMessage(raw: Buffer | ArrayBuffer | Buffer[]) {
   return parsed as JsonRecord;
 }
 
-function consumeRateLimit(participant: Participant) {
+function consumeRateLimit(participant: { rateWindowStartedAt: number; messagesInWindow: number }) {
   const now = Date.now();
   if (now - participant.rateWindowStartedAt >= config.rateLimitWindowMs) {
     participant.rateWindowStartedAt = now;
@@ -305,15 +322,94 @@ const server = createServer(async (request: IncomingMessage, response: ServerRes
 });
 
 const webSocketServer = new WebSocketServer({ noServer: true, maxPayload: config.maxMessageBytes });
+const whiteboardWebSocketServer = new WebSocketServer({ noServer: true, maxPayload: config.maxMessageBytes });
 
 server.on('upgrade', (request, socket, head) => {
   const origin = request.headers.origin;
   const url = new URL(request.url ?? '/', `http://${request.headers.host ?? 'localhost'}`);
-  if (url.pathname !== '/ws' || !originIsAllowed(origin)) {
+  if (!originIsAllowed(origin)) {
     socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n');
     return socket.destroy();
   }
+  if (url.pathname === '/whiteboard') {
+    const roomId = sanitizeRoomId(url.searchParams.get('roomId'));
+    const displayName = sanitizeDisplayName(url.searchParams.get('displayName'));
+    if (!roomId || !displayName) {
+      socket.write('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
+      return socket.destroy();
+    }
+    return whiteboardWebSocketServer.handleUpgrade(request, socket, head, ws => whiteboardWebSocketServer.emit('connection', ws, request));
+  }
+  if (url.pathname !== '/ws') {
+    socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n');
+    return socket.destroy();
+  }
   webSocketServer.handleUpgrade(request, socket, head, ws => webSocketServer.emit('connection', ws, request));
+});
+
+function sendWhiteboard(client: WhiteboardClient, message: JsonRecord) {
+  send(client.socket, message);
+}
+
+function broadcastWhiteboard(room: WhiteboardRoom, message: JsonRecord, exceptId?: string) {
+  for (const client of room.clients.values()) {
+    if (client.id !== exceptId) sendWhiteboard(client, message);
+  }
+}
+
+function leaveWhiteboard(socket: WebSocket) {
+  const client = whiteboardClients.get(socket);
+  if (!client) return;
+  whiteboardClients.delete(socket);
+  const room = whiteboardRooms.get(client.roomId);
+  room?.clients.delete(client.id);
+  if (!room) return;
+  broadcastWhiteboard(room, { type: 'cursor-left', identity: client.id }, client.id);
+  if (room.clients.size === 0) whiteboardRooms.delete(client.roomId);
+}
+
+whiteboardWebSocketServer.on('connection', (socket, request) => {
+  const url = new URL(request.url ?? '/', `http://${request.headers.host ?? 'localhost'}`);
+  const roomId = sanitizeRoomId(url.searchParams.get('roomId'))!;
+  const displayName = sanitizeDisplayName(url.searchParams.get('displayName'))!;
+  const room = whiteboardRooms.get(roomId) ?? { open: false, elements: new Map<string, JsonRecord>(), clients: new Map<string, WhiteboardClient>() };
+  if (room.clients.size >= 10) return socket.close(1008, 'Whiteboard room full');
+
+  const client: WhiteboardClient = {
+    id: randomUUID(), roomId, displayName, socket,
+    rateWindowStartedAt: Date.now(), messagesInWindow: 0,
+  };
+  room.clients.set(client.id, client);
+  whiteboardRooms.set(roomId, room);
+  whiteboardClients.set(socket, client);
+
+  sendWhiteboard(client, { type: 'whiteboard-mode', open: room.open });
+  for (const element of room.elements.values()) sendWhiteboard(client, { type: 'upsert', element });
+
+  socket.on('message', raw => {
+    try {
+      if (!consumeRateLimit(client)) return socket.close(1008, 'Rate limit exceeded');
+      const message = parseMessage(raw);
+      if (message.type === 'whiteboard-mode' && typeof message.open === 'boolean') {
+        room.open = message.open;
+      } else if (message.type === 'upsert' && message.element && typeof message.element === 'object' && !Array.isArray(message.element)) {
+        const element = message.element as JsonRecord;
+        if (typeof element.id !== 'string' || element.id.length > 100) return;
+        room.elements.set(element.id, element);
+      } else if (message.type === 'delete' && typeof message.id === 'string') {
+        room.elements.delete(message.id);
+      } else if (message.type === 'clear') {
+        room.elements.clear();
+      } else if (message.type !== 'cursor') {
+        return;
+      }
+      broadcastWhiteboard(room, { ...message, senderId: client.id, senderName: client.displayName }, client.id);
+    } catch {
+      socket.close(1008, 'Invalid whiteboard message');
+    }
+  });
+  socket.on('close', () => leaveWhiteboard(socket));
+  socket.on('error', () => leaveWhiteboard(socket));
 });
 
 webSocketServer.on('connection', socket => {
