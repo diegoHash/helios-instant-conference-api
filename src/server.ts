@@ -21,6 +21,7 @@ type WhiteboardClient = {
   roomId: string;
   displayName: string;
   socket: WebSocket;
+  isAlive: boolean;
   rateWindowStartedAt: number;
   messagesInWindow: number;
 };
@@ -29,6 +30,7 @@ type WhiteboardRoom = {
   open: boolean;
   elements: Map<string, JsonRecord>;
   clients: Map<string, WhiteboardClient>;
+  cleanupTimer?: NodeJS.Timeout;
 };
 
 const config = {
@@ -44,6 +46,7 @@ const config = {
   maxMessageBytes: readPositiveInteger('MAX_MESSAGE_BYTES', 65_536),
   maxMessagesPerWindow: readPositiveInteger('MAX_MESSAGES_PER_WINDOW', 120),
   maxWhiteboardMessagesPerWindow: readPositiveInteger('MAX_WHITEBOARD_MESSAGES_PER_WINDOW', 600),
+  whiteboardCleanupGraceMs: configValueForCleanup(),
   rateLimitWindowMs: readPositiveInteger('RATE_LIMIT_WINDOW_MS', 10_000),
   livekitApiUrl: process.env.LIVEKIT_API_URL ?? '',
   livekitWsUrl: process.env.LIVEKIT_WS_URL ?? '',
@@ -52,6 +55,10 @@ const config = {
   livekitTokenTtlSeconds: readPositiveInteger('LIVEKIT_TOKEN_TTL_SECONDS', 3_600),
   livekitMaxParticipants: Math.min(10, readPositiveInteger('LIVEKIT_MAX_PARTICIPANTS', 10)),
 };
+
+function configValueForCleanup() {
+  return process.env.NODE_ENV === 'test' ? 30 : readPositiveInteger('WHITEBOARD_CLEANUP_GRACE_MS', 75_000);
+}
 
 const livekitConfigured = Boolean(
   config.livekitApiUrl && config.livekitWsUrl && config.livekitApiKey && config.livekitApiSecret,
@@ -389,6 +396,21 @@ function broadcastWhiteboard(room: WhiteboardRoom, message: JsonRecord, exceptId
   }
 }
 
+function scheduleWhiteboardCleanup(roomId: string, room: WhiteboardRoom) {
+  if (room.cleanupTimer) clearTimeout(room.cleanupTimer);
+  room.cleanupTimer = setTimeout(async () => {
+    if (room.clients.size > 0) return;
+    try {
+      const participants = livekitRooms ? await livekitRooms.listParticipants(roomId) : [];
+      if (participants.length > 0) return scheduleWhiteboardCleanup(roomId, room);
+    } catch {
+      return scheduleWhiteboardCleanup(roomId, room);
+    }
+    if (room.clients.size === 0) whiteboardRooms.delete(roomId);
+  }, config.whiteboardCleanupGraceMs);
+  room.cleanupTimer.unref();
+}
+
 function leaveWhiteboard(socket: WebSocket) {
   const client = whiteboardClients.get(socket);
   if (!client) return;
@@ -397,7 +419,7 @@ function leaveWhiteboard(socket: WebSocket) {
   room?.clients.delete(client.id);
   if (!room) return;
   broadcastWhiteboard(room, { type: 'cursor-left', identity: client.id }, client.id);
-  if (room.clients.size === 0) whiteboardRooms.delete(client.roomId);
+  if (room.clients.size === 0) scheduleWhiteboardCleanup(client.roomId, room);
 }
 
 whiteboardWebSocketServer.on('connection', (socket, request) => {
@@ -406,9 +428,13 @@ whiteboardWebSocketServer.on('connection', (socket, request) => {
   const displayName = sanitizeDisplayName(url.searchParams.get('displayName'))!;
   const room = whiteboardRooms.get(roomId) ?? { open: false, elements: new Map<string, JsonRecord>(), clients: new Map<string, WhiteboardClient>() };
   if (room.clients.size >= 10) return socket.close(1008, 'Whiteboard room full');
+  if (room.cleanupTimer) {
+    clearTimeout(room.cleanupTimer);
+    room.cleanupTimer = undefined;
+  }
 
   const client: WhiteboardClient = {
-    id: randomUUID(), roomId, displayName, socket,
+    id: randomUUID(), roomId, displayName, socket, isAlive: true,
     rateWindowStartedAt: Date.now(), messagesInWindow: 0,
   };
   room.clients.set(client.id, client);
@@ -417,6 +443,7 @@ whiteboardWebSocketServer.on('connection', (socket, request) => {
 
   sendWhiteboard(client, { type: 'whiteboard-mode', open: room.open });
   for (const element of room.elements.values()) sendWhiteboard(client, { type: 'upsert', element });
+  socket.on('pong', () => { client.isAlive = true; });
 
   socket.on('message', raw => {
     try {
@@ -494,6 +521,16 @@ const heartbeat = setInterval(() => {
     if (participant) participant.isAlive = false;
     socket.ping();
   }
+  for (const socket of whiteboardWebSocketServer.clients) {
+    const client = whiteboardClients.get(socket);
+    if (client && !client.isAlive) {
+      leaveWhiteboard(socket);
+      socket.terminate();
+      continue;
+    }
+    if (client) client.isAlive = false;
+    socket.ping();
+  }
 }, 30_000);
 heartbeat.unref();
 
@@ -501,6 +538,8 @@ function shutdown(signal: string) {
   console.log(`[helios-conferences] ${signal}: closing ${sockets.size} connections`);
   clearInterval(heartbeat);
   for (const socket of webSocketServer.clients) socket.close(1001, 'Server shutting down');
+  for (const socket of whiteboardWebSocketServer.clients) socket.close(1001, 'Server shutting down');
+  for (const room of whiteboardRooms.values()) if (room.cleanupTimer) clearTimeout(room.cleanupTimer);
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(1), 10_000).unref();
 }

@@ -191,7 +191,16 @@ test('whiteboard state is shared with late participants and removed when the roo
     new Promise(resolve => first.once('close', resolve)),
     new Promise(resolve => second.once('close', resolve)),
   ]);
-  await delay(50);
+  await delay(10);
+
+  const { socket: reconnecting, messages: [reconnectingMode, reconnectingElement] } = await openWhiteboardSocket(
+    'board-room', 'Reconexión', ['whiteboard-mode', 'upsert'],
+  );
+  assert.equal((await reconnectingMode).open, true);
+  assert.ok(['stroke-1', 'stroke-live'].includes((await reconnectingElement).element.id));
+  reconnecting.close();
+  await new Promise(resolve => reconnecting.once('close', resolve));
+  await delay(80);
 
   const { socket: third, messages: [thirdMode] } = await openWhiteboardSocket('board-room', 'Tercero', ['whiteboard-mode']);
   t.after(() => third.close());
