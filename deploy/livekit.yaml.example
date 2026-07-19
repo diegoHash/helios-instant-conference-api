@@ -1,0 +1,26 @@
+port: 7880
+logging:
+  level: info
+  json: true
+rtc:
+  tcp_port: 7881
+  udp_port: 7882
+  use_external_ip: false
+  node_ip: 34.196.131.114
+  turn_servers:
+    - host: turn.caribbean-one.site
+      port: 3478
+      protocol: udp
+      secret_file: /etc/livekit-turn-secret
+      ttl: 3600
+    - host: turn.caribbean-one.site
+      port: 5349
+      protocol: tls
+      secret_file: /etc/livekit-turn-secret
+      ttl: 3600
+keys:
+  __LIVEKIT_API_KEY__: __LIVEKIT_API_SECRET__
+room:
+  empty_timeout: 300
+  departure_timeout: 60
+  max_participants: 10

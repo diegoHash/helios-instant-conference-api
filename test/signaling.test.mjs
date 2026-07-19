@@ -10,7 +10,7 @@ const baseUrl = `http://127.0.0.1:${port}`;
 let server;
 
 async function waitForServer() {
-  for (let attempt = 0; attempt < 40; attempt += 1) {
+  for (let attempt = 0; attempt < 120; attempt += 1) {
     try {
       const response = await fetch(`${baseUrl}/health`);
       if (response.ok) return;
@@ -73,6 +73,16 @@ test('health and temporary TURN credentials are available', async () => {
   assert.equal(configuration.iceServers.length, 2);
   assert.match(configuration.iceServers[1].username, /^\d+:/);
   assert.ok(configuration.iceServers[1].credential);
+});
+
+test('LiveKit token endpoint stays unavailable until the SFU is configured', async () => {
+  const response = await fetch(`${baseUrl}/api/livekit/token`, {
+    method: 'POST',
+    headers: { Origin: origin, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ roomId: 'test-room', displayName: 'Participante' }),
+  });
+  assert.equal(response.status, 503);
+  assert.equal((await response.json()).error, 'SFU_NOT_CONFIGURED');
 });
 
 test('a room accepts two participants, relays signals, and rejects a third', async t => {

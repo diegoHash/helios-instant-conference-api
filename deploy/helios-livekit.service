@@ -1,0 +1,17 @@
+[Unit]
+Description=Helios LiveKit SFU
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=5
+ExecStartPre=-/usr/bin/docker rm -f helios-livekit
+ExecStartPre=/usr/bin/docker pull livekit/livekit-server:v1.13.1
+ExecStart=/usr/bin/docker run --name helios-livekit --network host --read-only --security-opt no-new-privileges --cap-drop ALL -v /etc/helios-livekit.yaml:/etc/livekit.yaml:ro -v /etc/helios-livekit-turn-secret:/etc/livekit-turn-secret:ro livekit/livekit-server:v1.13.1 --config /etc/livekit.yaml
+ExecStop=/usr/bin/docker stop -t 20 helios-livekit
+
+[Install]
+WantedBy=multi-user.target

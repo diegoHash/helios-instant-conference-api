@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import { createHmac, randomBytes, randomUUID } from 'node:crypto';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { AccessToken, RoomServiceClient } from 'livekit-server-sdk';
 import { WebSocket, WebSocketServer } from 'ws';
 
 type JsonRecord = Record<string, unknown>;
@@ -28,7 +29,20 @@ const config = {
   maxMessageBytes: readPositiveInteger('MAX_MESSAGE_BYTES', 65_536),
   maxMessagesPerWindow: readPositiveInteger('MAX_MESSAGES_PER_WINDOW', 120),
   rateLimitWindowMs: readPositiveInteger('RATE_LIMIT_WINDOW_MS', 10_000),
+  livekitApiUrl: process.env.LIVEKIT_API_URL ?? '',
+  livekitWsUrl: process.env.LIVEKIT_WS_URL ?? '',
+  livekitApiKey: process.env.LIVEKIT_API_KEY ?? '',
+  livekitApiSecret: process.env.LIVEKIT_API_SECRET ?? '',
+  livekitTokenTtlSeconds: readPositiveInteger('LIVEKIT_TOKEN_TTL_SECONDS', 3_600),
+  livekitMaxParticipants: Math.min(10, readPositiveInteger('LIVEKIT_MAX_PARTICIPANTS', 10)),
 };
+
+const livekitConfigured = Boolean(
+  config.livekitApiUrl && config.livekitWsUrl && config.livekitApiKey && config.livekitApiSecret,
+);
+const livekitRooms = livekitConfigured
+  ? new RoomServiceClient(config.livekitApiUrl, config.livekitApiKey, config.livekitApiSecret)
+  : null;
 
 const rooms = new Map<string, Map<string, Participant>>();
 const sockets = new Map<WebSocket, Participant>();
@@ -65,10 +79,71 @@ function originIsAllowed(origin: string | undefined) {
 function corsHeaders(origin: string) {
   return {
     'Access-Control-Allow-Origin': origin,
-    'Access-Control-Allow-Methods': 'GET,OPTIONS',
+    'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type',
     Vary: 'Origin',
   };
+}
+
+async function readJsonBody(request: IncomingMessage) {
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const chunk of request) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    size += buffer.byteLength;
+    if (size > 16_384) throw new Error('BODY_TOO_LARGE');
+    chunks.push(buffer);
+  }
+  const parsed: unknown = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('INVALID_BODY');
+  return parsed as JsonRecord;
+}
+
+async function issueLivekitToken(request: IncomingMessage, response: ServerResponse, origin?: string) {
+  if (!livekitRooms) {
+    return json(response, 503, { error: 'SFU_NOT_CONFIGURED' }, origin);
+  }
+
+  try {
+    const body = await readJsonBody(request);
+    const roomId = sanitizeRoomId(body.roomId);
+    const displayName = sanitizeDisplayName(body.displayName);
+    if (!roomId || !displayName) return json(response, 400, { error: 'INVALID_JOIN' }, origin);
+
+    await livekitRooms.createRoom({
+      name: roomId,
+      emptyTimeout: 300,
+      departureTimeout: 60,
+      maxParticipants: config.livekitMaxParticipants,
+      metadata: JSON.stringify({ platform: 'Helios Platform', capacity: config.livekitMaxParticipants }),
+    });
+
+    const identity = randomUUID();
+    const token = new AccessToken(config.livekitApiKey, config.livekitApiSecret, {
+      identity,
+      name: displayName,
+      ttl: config.livekitTokenTtlSeconds,
+      metadata: JSON.stringify({ platform: 'Helios Platform' }),
+    });
+    token.addGrant({
+      room: roomId,
+      roomJoin: true,
+      canPublish: true,
+      canSubscribe: true,
+      canPublishData: true,
+    });
+
+    return json(response, 200, {
+      token: await token.toJwt(),
+      serverUrl: config.livekitWsUrl,
+      roomId,
+      participantIdentity: identity,
+      maxParticipants: config.livekitMaxParticipants,
+    }, origin);
+  } catch (error) {
+    console.error('[helios-conferences] LiveKit token error', error);
+    return json(response, 500, { error: 'TOKEN_ISSUE_FAILED' }, origin);
+  }
 }
 
 function makeIceServers() {
@@ -203,7 +278,7 @@ function relayMediaState(participant: Participant, message: JsonRecord) {
   }, participant.id);
 }
 
-const server = createServer((request: IncomingMessage, response: ServerResponse) => {
+const server = createServer(async (request: IncomingMessage, response: ServerResponse) => {
   const origin = request.headers.origin;
   if (!originIsAllowed(origin)) return json(response, 403, { error: 'ORIGIN_NOT_ALLOWED' });
   if (request.method === 'OPTIONS' && origin) {
@@ -222,6 +297,9 @@ const server = createServer((request: IncomingMessage, response: ServerResponse)
   }
   if (request.method === 'GET' && url.pathname === '/api/ice-servers') {
     return json(response, 200, { iceServers: makeIceServers() }, origin);
+  }
+  if (request.method === 'POST' && url.pathname === '/api/livekit/token') {
+    return issueLivekitToken(request, response, origin);
   }
   return json(response, 404, { error: 'NOT_FOUND' }, origin);
 });
