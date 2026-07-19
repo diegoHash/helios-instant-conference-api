@@ -54,6 +54,20 @@ function nextMessage(socket, expectedType) {
   });
 }
 
+function nextMatchingMessage(socket, predicate, description) {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error(`Timed out waiting for ${description}`)), 3_000);
+    const handler = raw => {
+      const message = JSON.parse(raw.toString());
+      if (!predicate(message)) return;
+      clearTimeout(timeout);
+      socket.off('message', handler);
+      resolve(message);
+    };
+    socket.on('message', handler);
+  });
+}
+
 test.before(async () => {
   server = spawn(process.execPath, ['dist/server.js'], {
     cwd: process.cwd(),
@@ -145,6 +159,23 @@ test('whiteboard state is shared with late participants and removed when the roo
   assert.equal((await secondMode).open, true);
   const upsert = await secondUpsert;
   assert.equal(upsert.element.id, 'stroke-1');
+
+  const strokeStart = nextMessage(second, 'stroke-start');
+  const strokePoints = nextMessage(second, 'stroke-points');
+  const strokeEnd = nextMessage(second, 'stroke-end');
+  first.send(JSON.stringify({ type: 'stroke-start', seq: 0, element: { id: 'stroke-live', type: 'pencil', points: [[5, 5]] } }));
+  first.send(JSON.stringify({ type: 'stroke-points', id: 'stroke-live', seq: 2, points: [[6, 6], [7, 7]] }));
+  first.send(JSON.stringify({ type: 'stroke-end', seq: 3, element: { id: 'stroke-live', type: 'pencil', points: [[5, 5], [6, 6], [7, 7]] } }));
+  assert.equal((await strokeStart).element.id, 'stroke-live');
+  assert.equal((await strokePoints).points.length, 2);
+  assert.equal((await strokeEnd).element.points.length, 3);
+
+  const finalCursor = nextMatchingMessage(second, message => message.type === 'cursor' && message.x === 299, 'last cursor in burst');
+  for (let index = 0; index < 300; index += 1) {
+    first.send(JSON.stringify({ type: 'cursor', x: index, y: index }));
+  }
+  assert.equal((await finalCursor).x, 299);
+  assert.equal(first.readyState, WebSocket.OPEN);
 
   first.close();
   second.close();

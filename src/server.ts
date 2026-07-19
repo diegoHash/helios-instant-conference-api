@@ -43,6 +43,7 @@ const config = {
   maxRoomParticipants: Math.min(2, readPositiveInteger('MAX_ROOM_PARTICIPANTS', 2)),
   maxMessageBytes: readPositiveInteger('MAX_MESSAGE_BYTES', 65_536),
   maxMessagesPerWindow: readPositiveInteger('MAX_MESSAGES_PER_WINDOW', 120),
+  maxWhiteboardMessagesPerWindow: readPositiveInteger('MAX_WHITEBOARD_MESSAGES_PER_WINDOW', 600),
   rateLimitWindowMs: readPositiveInteger('RATE_LIMIT_WINDOW_MS', 10_000),
   livekitApiUrl: process.env.LIVEKIT_API_URL ?? '',
   livekitWsUrl: process.env.LIVEKIT_WS_URL ?? '',
@@ -204,14 +205,14 @@ function parseMessage(raw: Buffer | ArrayBuffer | Buffer[]) {
   return parsed as JsonRecord;
 }
 
-function consumeRateLimit(participant: { rateWindowStartedAt: number; messagesInWindow: number }) {
+function consumeRateLimit(participant: { rateWindowStartedAt: number; messagesInWindow: number }, maximum = config.maxMessagesPerWindow) {
   const now = Date.now();
   if (now - participant.rateWindowStartedAt >= config.rateLimitWindowMs) {
     participant.rateWindowStartedAt = now;
     participant.messagesInWindow = 0;
   }
   participant.messagesInWindow += 1;
-  return participant.messagesInWindow <= config.maxMessagesPerWindow;
+  return participant.messagesInWindow <= maximum;
 }
 
 function broadcast(roomId: string, message: JsonRecord, exceptId?: string) {
@@ -348,6 +349,7 @@ server.on('upgrade', (request, socket, head) => {
 });
 
 function sendWhiteboard(client: WhiteboardClient, message: JsonRecord) {
+  if ((message.type === 'cursor' || message.type === 'stroke-points') && client.socket.bufferedAmount > 128_000) return;
   send(client.socket, message);
 }
 
@@ -388,11 +390,20 @@ whiteboardWebSocketServer.on('connection', (socket, request) => {
 
   socket.on('message', raw => {
     try {
-      if (!consumeRateLimit(client)) return socket.close(1008, 'Rate limit exceeded');
+      if (!consumeRateLimit(client, config.maxWhiteboardMessagesPerWindow)) return socket.close(1008, 'Rate limit exceeded');
       const message = parseMessage(raw);
       if (message.type === 'whiteboard-mode' && typeof message.open === 'boolean') {
         room.open = message.open;
       } else if (message.type === 'upsert' && message.element && typeof message.element === 'object' && !Array.isArray(message.element)) {
+        const element = message.element as JsonRecord;
+        if (typeof element.id !== 'string' || element.id.length > 100) return;
+        room.elements.set(element.id, element);
+      } else if (message.type === 'stroke-start' && message.element && typeof message.element === 'object' && !Array.isArray(message.element)) {
+        const element = message.element as JsonRecord;
+        if (typeof element.id !== 'string' || !Array.isArray(element.points)) return;
+      } else if (message.type === 'stroke-points' && typeof message.id === 'string' && Array.isArray(message.points)) {
+        if (message.points.length > 32) return;
+      } else if (message.type === 'stroke-end' && message.element && typeof message.element === 'object' && !Array.isArray(message.element)) {
         const element = message.element as JsonRecord;
         if (typeof element.id !== 'string' || element.id.length > 100) return;
         room.elements.set(element.id, element);
